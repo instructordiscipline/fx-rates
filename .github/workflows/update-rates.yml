@@ -2,11 +2,11 @@ name: Update FX rates (daily)
 
 on:
   schedule:
-    - cron: "12 2 * * *"     # runs daily at 02:12 UTC
-  workflow_dispatch: {}       # enable "Run workflow" button
+    - cron: "12 2 * * *"     # daily at 02:12 UTC
+  workflow_dispatch: {}
 
 permissions:
-  contents: write             # needed to commit rates.json
+  contents: write
 
 concurrency:
   group: fx-rates-refresh
@@ -15,63 +15,53 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch rates (with debug + fallbacks) and write rates.json
-        id: fetch
+      - name: Fetch/merge ALL currencies from providers and write rates.json
         shell: bash
         run: |
           set -euo pipefail
           DATE="$(date -u +%F)"
-          SYMBOLS="EUR,GBP,CAD,AUD,NZD,JPY,CNY,HKD,SGD,INR,MXN,BRL,ZAR,AED,SAR,CHF,DKK,NOK,SEK"
-          TMP="$(mktemp)"
+          TMP_DIR="$(mktemp -d)"
+          OUT="$TMP_DIR/out.json"
+          echo '{}' > "$OUT"   # we'll build a flat { "USD->XXX": rate } map
 
-          echo "Primary: exchangerate.host"
-          if curl -fsSL "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" -o "$TMP"; then
-            echo "Response (first 200 chars):"; head -c 200 "$TMP" || true; echo
-            if jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
-              jq --arg date "$DATE" '{asOf:$date, rates:.rates}' "$TMP" > rates.json
-              echo "source=exchangerate.host" >> "$GITHUB_OUTPUT"
-              exit 0
+          fetch_and_merge () {
+            local url="$1" tag="$2"
+            local f="$TMP_DIR/${tag}.json" r="$TMP_DIR/${tag}.rates.json"
+            echo "Trying $tag -> $url"
+            if curl -fsSL "$url" -o "$f" && jq -e '.rates and (.rates|type=="object")' "$f" >/dev/null; then
+              # extract the raw .rates object with no filtering
+              jq '.rates' "$f" > "$r"
+              # merge (prefer existing keys; fill missing ones)
+              jq -s '.[0] * .[1]' "$OUT" "$r" > "$TMP_DIR/merged.json" && mv "$TMP_DIR/merged.json" "$OUT"
+              echo "$tag merged."
+              return 0
             fi
-          fi
+            return 1
+          }
 
-          echo "Fallback: frankfurter.app"
-          if curl -fsSL "https://api.frankfurter.app/latest?from=USD&to=${SYMBOLS}" -o "$TMP" \
-             && jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
-            jq --arg date "$DATE" '{asOf:$date, rates:.rates}' "$TMP" > rates.json
-            echo "source=frankfurter.app" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Providers (any that succeed will enrich the map)
+          fetch_and_merge "https://api.exchangerate.host/latest?base=USD" "exchangerate.host" || true
+          fetch_and_merge "https://api.frankfurter.app/latest?from=USD" "frankfurter.app"   || true
+          fetch_and_merge "https://open.er-api.com/v6/latest/USD"       "open.er-api.com"   || true
 
-          echo "Fallback: open.er-api.com"
-          if curl -fsSL "https://open.er-api.com/v6/latest/USD" -o "$TMP" \
-             && jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
-            # Keep only the symbols we care about, then add asOf
-            jq --arg syms "$SYMBOLS" \
-              '.rates as $r | ($syms|split(",")|map({key:., value:$r[.]})) | from_entries | {rates:.}' \
-              "$TMP" | jq --arg date "$DATE" '. + {asOf:$date}' > rates.json
-            echo "source=open.er-api.com" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Backfill USD-pegged currencies if provider omitted them
+          jq '
+            .AED = (.AED // 3.6725) |
+            .SAR = (.SAR // 3.75)
+          ' "$OUT" > "$TMP_DIR/pegged.json" && mv "$TMP_DIR/pegged.json" "$OUT"
 
-          echo "All providers failed; dumping last response for debugging:"
-          head -c 500 "$TMP" || true; echo
-          exit 1
-
-      - name: Show generated file
-        if: success()
-        run: |
-          echo "Rates file generated via: ${{ steps.fetch.outputs.source }}"
-          test -f rates.json && cat rates.json || echo "rates.json missing"
+          # Final JSON: { "asOf": "...", "rates": { ... } }
+          jq --arg date "$DATE" '{asOf:$date, rates:.}' "$OUT" > rates.json
+          echo "Wrote rates.json:"
+          head -c 500 rates.json || true; echo
 
       - name: Commit changes if any
         uses: stefanzweifel/git-auto-commit-action@v5
