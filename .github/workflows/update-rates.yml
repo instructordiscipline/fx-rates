@@ -2,30 +2,76 @@ name: Update FX rates (daily)
 
 on:
   schedule:
-    - cron: "12 2 * * *"   # daily 02:12 UTC
-  workflow_dispatch: {}
+    - cron: "12 2 * * *"     # runs daily at 02:12 UTC
+  workflow_dispatch: {}       # enable "Run workflow" button
 
 permissions:
-  contents: write
+  contents: write             # needed to commit rates.json
+
+concurrency:
+  group: fx-rates-refresh
+  cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch USD -> target rates and write rates.json
+      - name: Fetch rates (with debug + fallbacks) and write rates.json
+        id: fetch
+        shell: bash
         run: |
           set -euo pipefail
           DATE="$(date -u +%F)"
           SYMBOLS="EUR,GBP,CAD,AUD,NZD,JPY,CNY,HKD,SGD,INR,MXN,BRL,ZAR,AED,SAR,CHF,DKK,NOK,SEK"
-          curl -fsSL "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" -o resp.json
-          jq -e '.rates and (.rates | type=="object")' resp.json >/dev/null
-          jq --arg date "$DATE" '{asOf:$date, rates:.rates}' resp.json > rates.json
-          echo "Wrote rates.json:" && cat rates.json
+          TMP="$(mktemp)"
+
+          echo "Primary: exchangerate.host"
+          if curl -fsSL "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" -o "$TMP"; then
+            echo "Response (first 200 chars):"; head -c 200 "$TMP" || true; echo
+            if jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
+              jq --arg date "$DATE" '{asOf:$date, rates:.rates}' "$TMP" > rates.json
+              echo "source=exchangerate.host" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Fallback: frankfurter.app"
+          if curl -fsSL "https://api.frankfurter.app/latest?from=USD&to=${SYMBOLS}" -o "$TMP" \
+             && jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
+            jq --arg date "$DATE" '{asOf:$date, rates:.rates}' "$TMP" > rates.json
+            echo "source=frankfurter.app" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Fallback: open.er-api.com"
+          if curl -fsSL "https://open.er-api.com/v6/latest/USD" -o "$TMP" \
+             && jq -e '.rates and (.rates|type=="object")' "$TMP" >/dev/null; then
+            # Keep only the symbols we care about, then add asOf
+            jq --arg syms "$SYMBOLS" \
+              '.rates as $r | ($syms|split(",")|map({key:., value:$r[.]})) | from_entries | {rates:.}' \
+              "$TMP" | jq --arg date "$DATE" '. + {asOf:$date}' > rates.json
+            echo "source=open.er-api.com" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "All providers failed; dumping last response for debugging:"
+          head -c 500 "$TMP" || true; echo
+          exit 1
+
+      - name: Show generated file
+        if: success()
+        run: |
+          echo "Rates file generated via: ${{ steps.fetch.outputs.source }}"
+          test -f rates.json && cat rates.json || echo "rates.json missing"
 
       - name: Commit changes if any
         uses: stefanzweifel/git-auto-commit-action@v5
