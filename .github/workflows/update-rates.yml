@@ -1,0 +1,31 @@
+name: Update FX rates (daily)
+
+on:
+  schedule:
+    - cron: "12 2 * * *"  # runs daily at 02:12 UTC
+  workflow_dispatch: {}     # lets you run it manually
+
+permissions:
+  contents: write  # allow the workflow to push changes
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch USD -> target rates and write rates.json
+        run: |
+          DATE="$(date -u +%F)"
+          SYMBOLS="EUR,GBP,CAD,AUD,NZD,JPY,CNY,HKD,SGD,INR,MXN,BRL,ZAR,AED,SAR,CHF,DKK,NOK,SEK"
+          curl -s "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" \
+          | jq --arg date "$DATE" '{asOf:$date, rates:.rates}' > rates.json
+
+      - name: Commit changes if any
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: refresh FX rates"
+          file_pattern: rates.json
