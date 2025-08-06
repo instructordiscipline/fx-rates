@@ -2,11 +2,11 @@ name: Update FX rates (daily)
 
 on:
   schedule:
-    - cron: "12 2 * * *"  # runs daily at 02:12 UTC
-  workflow_dispatch: {}     # lets you run it manually
+    - cron: "12 2 * * *"   # daily 02:12 UTC
+  workflow_dispatch: {}
 
 permissions:
-  contents: write  # allow the workflow to push changes
+  contents: write
 
 jobs:
   update:
@@ -19,10 +19,13 @@ jobs:
 
       - name: Fetch USD -> target rates and write rates.json
         run: |
+          set -euo pipefail
           DATE="$(date -u +%F)"
           SYMBOLS="EUR,GBP,CAD,AUD,NZD,JPY,CNY,HKD,SGD,INR,MXN,BRL,ZAR,AED,SAR,CHF,DKK,NOK,SEK"
-          curl -s "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" \
-          | jq --arg date "$DATE" '{asOf:$date, rates:.rates}' > rates.json
+          curl -fsSL "https://api.exchangerate.host/latest?base=USD&symbols=${SYMBOLS}" -o resp.json
+          jq -e '.rates and (.rates | type=="object")' resp.json >/dev/null
+          jq --arg date "$DATE" '{asOf:$date, rates:.rates}' resp.json > rates.json
+          echo "Wrote rates.json:" && cat rates.json
 
       - name: Commit changes if any
         uses: stefanzweifel/git-auto-commit-action@v5
